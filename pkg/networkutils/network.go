@@ -66,6 +66,11 @@ const (
 	// Defaults to empty.
 	envExcludeSNATCIDRs = "AWS_VPC_K8S_CNI_EXCLUDE_SNAT_CIDRS"
 
+	// This environment is used to specify a comma separated list of ipv4 CIDRs to include in SNAT. An additional rule
+	// will be written to the iptables for each item. If an item is not an ipv4 range it will be skipped.
+	// Defaults to empty.
+	envIncludeSNATCIDRs = "AWS_VPC_K8S_CNI_INCLUDE_SNAT_CIDRS"
+
 	// This environment is used to specify weather the SNAT rule added to iptables should randomize port
 	// allocation for outgoing connections. If set to "hashrandom" the SNAT iptables rule will have the "--random" flag
 	// added to it. Set it to "prng" if you want to use a pseudo random numbers, i.e. "--random-fully".
@@ -122,6 +127,7 @@ type NetworkAPIs interface {
 	SetupENINetwork(eniIP string, mac string, table int, subnetCIDR string) error
 	UseExternalSNAT() bool
 	GetExcludeSNATCIDRs() []string
+	GetIncludeSNATCIDRs() []string
 	GetRuleList() ([]netlink.Rule, error)
 	GetRuleListBySrc(ruleList []netlink.Rule, src net.IPNet) ([]netlink.Rule, error)
 	UpdateRuleListBySrc(ruleList []netlink.Rule, src net.IPNet, toCIDRs []string, toFlag bool) error
@@ -131,6 +137,7 @@ type NetworkAPIs interface {
 type linuxNetwork struct {
 	useExternalSNAT         bool
 	excludeSNATCIDRs        []string
+	includeSNATCIDRs        []string
 	typeOfSNAT              snatType
 	nodePortSupportEnabled  bool
 	shouldConfigureRpFilter bool
@@ -170,6 +177,7 @@ func New() NetworkAPIs {
 	return &linuxNetwork{
 		useExternalSNAT:         useExternalSNAT(),
 		excludeSNATCIDRs:        getExcludeSNATCIDRs(),
+		includeSNATCIDRs:        getIncludeSNATCIDRs(),
 		typeOfSNAT:              typeOfSNAT(),
 		nodePortSupportEnabled:  nodePortSupportEnabled(),
 		shouldConfigureRpFilter: shouldConfigureRpFilter(),
@@ -301,13 +309,20 @@ func (n *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, vpcCIDRs []*string, 
 	type snatCIDR struct {
 		cidr        string
 		isExclusion bool
+		isInclusion bool
 	}
 	var allCIDRs []snatCIDR
 	for _, cidr := range vpcCIDRs {
-		allCIDRs = append(allCIDRs, snatCIDR{cidr: *cidr, isExclusion: false})
+		allCIDRs = append(allCIDRs, snatCIDR{cidr: *cidr, isExclusion: false, isInclusion: false})
 	}
 	for _, cidr := range n.excludeSNATCIDRs {
-		allCIDRs = append(allCIDRs, snatCIDR{cidr: cidr, isExclusion: true})
+		allCIDRs = append(allCIDRs, snatCIDR{cidr: cidr, isExclusion: true, isInclusion: false})
+	}
+	if n.includeSNATCIDRs != nil {
+		allCIDRs = allCIDRs[:0]
+		for _, cidr := range n.includeSNATCIDRs {
+			allCIDRs = append(allCIDRs, snatCIDR{cidr: cidr, isExclusion: false, isInclusion: true})
+		}
 	}
 
 	// if excludeSNATCIDRs or vpcCIDRs have changed they need to be cleared
@@ -348,16 +363,30 @@ func (n *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, vpcCIDRs []*string, 
 		if cidr.isExclusion {
 			comment += " EXCLUSION"
 		}
-		log.Debugf("Setup Host Network: iptables -A %s ! -d %s -t nat -j %s", curChain, cidr, nextChain)
+		if cidr.isInclusion {
+			comment += " INCLUSION"
+			log.Debugf("Setup Host Network: iptables -A %s -d %s -t nat -j %s", curChain, cidr, nextChain)
 
-		iptableRules = append(iptableRules, iptablesRule{
-			name:        curName,
-			shouldExist: !n.useExternalSNAT,
-			table:       "nat",
-			chain:       curChain,
-			rule: []string{
-				"!", "-d", cidr.cidr, "-m", "comment", "--comment", comment, "-j", nextChain,
-			}})
+			iptableRules = append(iptableRules, iptablesRule{
+				name:        curName,
+				shouldExist: !n.useExternalSNAT,
+				table:       "nat",
+				chain:       curChain,
+				rule: []string{
+					"-d", cidr.cidr, "-m", "comment", "--comment", comment, "-j", nextChain,
+				}})	
+		}else{
+			log.Debugf("Setup Host Network: iptables -A %s ! -d %s -t nat -j %s", curChain, cidr, nextChain)
+
+			iptableRules = append(iptableRules, iptablesRule{
+				name:        curName,
+				shouldExist: !n.useExternalSNAT,
+				table:       "nat",
+				chain:       curChain,
+				rule: []string{
+					"!", "-d", cidr.cidr, "-m", "comment", "--comment", comment, "-j", nextChain,
+				}})
+		}
 	}
 
 	// Prepare the Desired Rule for SNAT Rule
@@ -531,6 +560,7 @@ func GetConfigForDebug() map[string]interface{} {
 	return map[string]interface{}{
 		envExternalSNAT:     useExternalSNAT(),
 		envExcludeSNATCIDRs: getExcludeSNATCIDRs(),
+		envIncludeSNATCIDRs: getIncludeSNATCIDRs(),
 		envNodePortSupport:  nodePortSupportEnabled(),
 		envConnmark:         getConnmark(),
 		envRandomizeSNAT:    typeOfSNAT(),
@@ -563,11 +593,46 @@ func getExcludeSNATCIDRs() []string {
 	if excludeCIDRs == "" {
 		return nil
 	}
+	includeCIDRs := os.Getenv(envIncludeSNATCIDRs)
+	if includeCIDRs != "" {
+		return nil
+	}
 	var cidrs []string
 	for _, excludeCIDR := range strings.Split(excludeCIDRs, ",") {
 		_, parseCIDR, err := net.ParseCIDR(excludeCIDR)
 		if err != nil {
 			log.Errorf("getExcludeSNATCIDRs : ignoring %v is not a valid IPv4 CIDR", excludeCIDR)
+		} else {
+			cidrs = append(cidrs, parseCIDR.String())
+		}
+	}
+	return cidrs
+}
+
+// GetIncludeSNATCIDRs returns a list of cidrs that should be included in SNAT if UseExternalSNAT is false, and if ExcludeSNATCIDR is empty,
+// otherwise it returns an empty list.
+func (n *linuxNetwork) GetIncludeSNATCIDRs() []string {
+	return getIncludeSNATCIDRs()
+}
+
+func getIncludeSNATCIDRs() []string {
+	if useExternalSNAT() {
+		return nil
+	}
+
+	includeCIDRs := os.Getenv(envIncludeSNATCIDRs)
+	if includeCIDRs == "" {
+		return nil
+	}
+	excludeCIDRs := os.Getenv(envExcludeSNATCIDRs)
+	if excludeCIDRs != "" {
+		return nil
+	}
+	var cidrs []string
+	for _, includeCIDR := range strings.Split(includeCIDRs, ",") {
+		_, parseCIDR, err := net.ParseCIDR(includeCIDR)
+		if err != nil {
+			log.Errorf("getIncludeSNATCIDRs : ignoring %v is not a valid IPv4 CIDR", includeCIDR)
 		} else {
 			cidrs = append(cidrs, parseCIDR.String())
 		}
@@ -894,6 +959,7 @@ func (n *linuxNetwork) UpdateRuleListBySrc(ruleList []netlink.Rule, src net.IPNe
 
 	if requiresSNAT {
 		allCIDRs := append(toCIDRs, n.excludeSNATCIDRs...)
+		allCIDRs = append(allCIDRs, n.includeSNATCIDRs...)
 		for _, cidr := range allCIDRs {
 			podRule := n.netLink.NewRule()
 			_, podRule.Dst, _ = net.ParseCIDR(cidr)
