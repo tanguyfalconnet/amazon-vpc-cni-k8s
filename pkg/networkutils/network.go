@@ -333,7 +333,15 @@ func (n *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, vpcCIDRs []*string, 
 
 	// build IPTABLES chain for SNAT of non-VPC outbound traffic and excluded CIDRs
 	var chains []string
-	for i := 0; i <= len(allCIDRs); i++ {
+
+	// if include snat mode, all cidr iptables have to be in one chain
+	var chainsLen int
+	if n.includeSNATCIDRs != nil {
+		chainsLen = 1
+	}else{
+		chainsLen = len(allCIDRs)
+	}
+	for i := 0; i <= chainsLen; i++ {
 		chain := fmt.Sprintf("AWS-SNAT-CHAIN-%d", i)
 		log.Debugf("Setup Host Network: iptables -N %s -t nat", chain)
 		if err := ipt.NewChain("nat", chain); err != nil && !containChainExistErr(err) {
@@ -356,14 +364,11 @@ func (n *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, vpcCIDRs []*string, 
 		}})
 
 	for i, cidr := range allCIDRs {
-		curChain := chains[i]
-		curName := fmt.Sprintf("[%d] AWS-SNAT-CHAIN", i)
-		nextChain := chains[i+1]
 		comment := "AWS SNAT CHAIN"
-		if cidr.isExclusion {
-			comment += " EXCLUSION"
-		}
 		if cidr.isInclusion {
+			curChain := chains[0]
+			curName := fmt.Sprintf("[%d] AWS-SNAT-CHAIN", 0)
+			nextChain := chains[1]
 			comment += " INCLUSION"
 			log.Debugf("Setup Host Network: iptables -A %s -d %s -t nat -j %s", curChain, cidr, nextChain)
 
@@ -376,6 +381,12 @@ func (n *linuxNetwork) SetupHostNetwork(vpcCIDR *net.IPNet, vpcCIDRs []*string, 
 					"-d", cidr.cidr, "-m", "comment", "--comment", comment, "-j", nextChain,
 				}})	
 		}else{
+			curChain := chains[i]
+			curName := fmt.Sprintf("[%d] AWS-SNAT-CHAIN", i)
+			nextChain := chains[i+1]
+			if cidr.isExclusion {
+				comment += " EXCLUSION"
+			}
 			log.Debugf("Setup Host Network: iptables -A %s ! -d %s -t nat -j %s", curChain, cidr, nextChain)
 
 			iptableRules = append(iptableRules, iptablesRule{
